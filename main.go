@@ -297,112 +297,144 @@ func handleConnection(clientConn net.Conn) {
 		// HTTP response headers and body
 		response := "HTTP/1.1 502 OK\r\n" +
 			"Content-Type: text/plain; charset=utf-8\r\n" +
-			"Content-Length: 21\r\n" +
+			"Content-Length: 13\r\n" +
 			"\r\n" +
-			"nginx, malformed data"
+			"Hello, world!"
 
-		// Write the response to the connection
-		_, err := clientConn.Write([]byte(response))
-		if err != nil {
-			log.Println("Error writing response:", err)
-		}
+		// Send the response to the client
+		clientConn.Write([]byte(response))
+
 		return
 	}
 
-	targetHost := strings.ToLower(clientHello.ServerName)
+	target := clientHello.ServerName + ":443"
 
-	if targetHost == config.Host {
-		targetHost = "127.0.0.1:8443"
-	} else {
-		targetHost = net.JoinHostPort(targetHost, "443")
-	}
-
-	backendConn, err := net.DialTimeout("tcp", targetHost, 5*time.Second)
+	serverConn, err := net.DialTimeout("tcp", target, 3*time.Second)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	defer backendConn.Close()
+	defer serverConn.Close()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		io.Copy(clientConn, backendConn)
-		clientConn.(*net.TCPConn).CloseWrite()
-		wg.Done()
-	}()
-	go func() {
-		io.Copy(backendConn, clientHelloBytes)
-		io.Copy(backendConn, clientConn)
-		backendConn.(*net.TCPConn).CloseWrite()
-		wg.Done()
-	}()
-
-	wg.Wait()
-}
-
-// handleDoHRequest processes the DoH request with rate limiting using fasthttp.
-func handleDoHRequest(ctx *fasthttp.RequestCtx) {
-	if !limiter.Allow() {
-		ctx.Error("Rate limit exceeded", fasthttp.StatusTooManyRequests)
+	if err := clientConn.SetReadDeadline(time.Time{}); err != nil {
+		log.Println(err)
 		return
 	}
 
-	var body []byte
-	var err error
+	if _, err := io.Copy(serverConn, clientHelloBytes); err != nil {
+		log.Println(err)
+		return
+	}
 
-	switch string(ctx.Method()) {
-	case "GET":
-		dnsQueryParam := ctx.QueryArgs().Peek("dns")
-		if dnsQueryParam == nil {
-			ctx.Error("Missing 'dns' query parameter", fasthttp.StatusBadRequest)
+	go func() {
+		if _, err := io.Copy(serverConn, clientConn); err != nil {
+			log.Println(err)
+		}
+	}()
+
+	if _, err := io.Copy(clientConn, serverConn); err != nil {
+		log.Println(err)
+	}
+}
+
+func dohHandler(ctx *fasthttp.RequestCtx) {
+	if string(ctx.Method()) == http.MethodPost || string(ctx.Method()) == http.MethodGet {
+		ctx.Response.Header.Set("Content-Type", "application/dns-message")
+		if string(ctx.Method()) == http.MethodGet {
+			request := ctx.FormValue("dns")
+			requestBinary, err := base64.RawURLEncoding.DecodeString(string(request))
+			if err != nil {
+				ctx.Error("invalid request", fasthttp.StatusBadRequest)
+				return
+			}
+			response, err := processDNSQuery(requestBinary)
+			if err != nil {
+				ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
+				return
+			}
+			ctx.SetBody(response)
 			return
 		}
-		body, err = base64.RawURLEncoding.DecodeString(string(dnsQueryParam))
+
+		response, err := processDNSQuery(ctx.PostBody())
 		if err != nil {
-			ctx.Error("Invalid 'dns' query parameter", fasthttp.StatusBadRequest)
+			ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
 			return
 		}
-	case "POST":
-		body = ctx.PostBody()
-		if len(body) == 0 {
-			ctx.Error("Empty request body", fasthttp.StatusBadRequest)
-			return
-		}
-	default:
-		ctx.Error("Only GET and POST methods are allowed", fasthttp.StatusMethodNotAllowed)
+
+		ctx.SetBody(response)
 		return
 	}
-
-	dnsResponse, err := processDNSQuery(body)
-	if err != nil {
-		ctx.Error("Failed to process DNS query", fasthttp.StatusInternalServerError)
-		return
-	}
-
-	ctx.SetContentType("application/dns-message")
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.Write(dnsResponse)
+	ctx.Error("not found", fasthttp.StatusNotFound)
 }
 
-// runDOHServer starts the DNS-over-HTTPS server using fasthttp.
 func runDOHServer() {
 	server := &fasthttp.Server{
-		Handler: func(ctx *fasthttp.RequestCtx) {
-			switch string(ctx.Path()) {
-			case "/dns-query":
-				handleDoHRequest(ctx)
-			default:
-				ctx.Error("Unsupported path", fasthttp.StatusNotFound)
-			}
-		},
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Handler:        dohHandler,
+		ReadTimeout:    5 * time.Second,
+		WriteTimeout:   5 * time.Second,
+		MaxConnsPerIP:  10,
+		MaxRequestBodySize: 512,
 	}
 
-	if err := server.ListenAndServe("127.0.0.1:8080"); err != nil {
-		log.Fatalf("Error in DoH Server: %s", err)
+	certPrefix := "/etc/letsencrypt/live/" + config.Host + "/"
+
+	tlsConfig := &tls.Config{
+		PreferServerCipherSuites: true,
+		Certificates: []tls.Certificate{loadTLSCertificate(certPrefix + "fullchain.pem", certPrefix + "privkey.pem")},
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+
+	log.Println("Starting DoH server on :443/dns-query")
+	err := server.ListenAndServeTLS(":443", certPrefix+"fullchain.pem", certPrefix+"privkey.pem")
+	if err != nil {
+		log.Fatalf("Error starting DoH server: %v", err)
+	}
+}
+
+// loadTLSCertificate loads a TLS certificate from the specified files.
+func loadTLSCertificate(certFile, keyFile string) tls.Certificate {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		log.Fatalf("Error loading TLS certificate: %v", err)
+	}
+	return cert
+}
+
+// DNS handler for standard DNS queries (port 53).
+func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+	msg := new(dns.Msg)
+	msg.SetReply(r)
+	msg.Authoritative = true
+
+	domain := r.Question[0].Name
+
+	if ip, ok := findValueByKeyContains(config.Domains, domain); ok {
+		rr := &dns.A{
+			Hdr: dns.RR_Header{
+				Name:   domain,
+				Rrtype: dns.TypeA,
+				Class:  dns.ClassINET,
+				Ttl:    3600,
+			},
+			A: net.ParseIP(ip),
+		}
+		msg.Answer = append(msg.Answer, rr)
+	} else {
+		msg.SetRcode(r, dns.RcodeNameError) // Return NXDOMAIN if domain not found
+	}
+
+	w.WriteMsg(msg)
+}
+
+// startDNSServer starts the standard DNS server on port 53.
+func startDNSServer() {
+	dns.HandleFunc(".", handleDNSRequest)
+	server := &dns.Server{Addr: ":53", Net: "udp"}
+	log.Printf("Starting DNS server on :53...")
+	err := server.ListenAndServe()
+	if err != nil {
+		log.Fatalf("Failed to start DNS server: %s\n", err.Error())
 	}
 }
 
@@ -418,10 +450,10 @@ func main() {
 	}
 	config = cfg
 
-	log.Println("Starting SSNI proxy server on :443, :853...")
+	log.Println("Starting servers...")
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	limiter = rate.NewLimiter(10, 50) // 1 request per second with a burst size of 5
 
@@ -435,6 +467,10 @@ func main() {
 	}()
 	go func() {
 		serveSniProxy()
+		wg.Done()
+	}()
+	go func() {
+		startDNSServer() // Start the standard DNS server
 		wg.Done()
 	}()
 
